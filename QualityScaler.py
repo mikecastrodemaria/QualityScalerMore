@@ -81,17 +81,18 @@ from numpy import (
     ndarray           as numpy_ndarray,
     ascontiguousarray as numpy_ascontiguousarray,
     frombuffer        as numpy_frombuffer,
-    concatenate       as numpy_concatenate, 
+    concatenate       as numpy_concatenate,
     transpose         as numpy_transpose,
-    full              as numpy_full, 
-    zeros             as numpy_zeros, 
+    full              as numpy_full,
+    zeros             as numpy_zeros,
     expand_dims       as numpy_expand_dims,
     squeeze           as numpy_squeeze,
     clip              as numpy_clip,
     mean              as numpy_mean,
     repeat            as numpy_repeat,
     array_split       as numpy_array_split,
-    max               as numpy_max, 
+    max               as numpy_max,
+    float16,
     float32,
     uint8
 )
@@ -134,22 +135,29 @@ widget_background_color = "#181818"
 text_color              = "#B8B8B8"
 
 VRAM_model_usage = {
-    'RealESR_Gx4':     2.5,
-    'RealESR_Animex4': 2.5,
-    'BSRGANx4':        0.75,
-    'RealESRGANx4':    0.75,
-    'BSRGANx2':        0.8,
-    'IRCNN_Mx1':       4,
-    'IRCNN_Lx1':       4,
-    'UltraSharpx4':    4,
+    'RealESR_Gx4':        2.5,
+    'RealESR_Animex4':    2.5,
+    'BSRGANx4':           0.75,
+    'RealESRGANx4':       0.75,
+    'BSRGANx2':           0.8,
+    'IRCNN_Mx1':          4,
+    'IRCNN_Lx1':          4,
+    'UltraSharpx4':       4,
+    'ClearRealityV1':     4,
+    'ClearRealityV1_Soft':4,
 }
 
 MENU_LIST_SEPARATOR         = [ "----" ]
-SRVGGNetCompact_models_list = [ "RealESR_Gx4", "RealESR_Animex4", "UltraSharpx4" ]
+SRVGGNetCompact_models_list = [ "RealESR_Gx4", "RealESR_Animex4", "UltraSharpx4", "ClearRealityV1", "ClearRealityV1_Soft" ]
 BSRGAN_models_list          = [ "BSRGANx4", "BSRGANx2", "RealESRGANx4" ]
 IRCNN_models_list           = [ "IRCNN_Mx1", "IRCNN_Lx1" ]
 
 AI_models_list         = ( SRVGGNetCompact_models_list + MENU_LIST_SEPARATOR + BSRGAN_models_list + MENU_LIST_SEPARATOR + IRCNN_models_list )
+
+AI_MODEL_UPSCALE_OVERRIDES = {
+    "ClearRealityV1": 4,
+    "ClearRealityV1_Soft": 4,
+}
 AI_multithreading_list = [ "OFF", "2 threads", "4 threads", "6 threads", "8 threads"]
 blending_list          = [ "OFF", "Low", "Medium", "High" ]
 gpus_list              = [ "Auto", "GPU 1", "GPU 2", "GPU 3", "GPU 4" ]
@@ -267,9 +275,9 @@ class AI_upscale:
     # CLASS INIT FUNCTIONS
 
     def __init__(
-            self, 
-            AI_model_name: str, 
-            directml_gpu: str, 
+            self,
+            AI_model_name: str,
+            directml_gpu: str,
             input_resize_factor: int,
             output_resize_factor: int,
             max_resolution: int
@@ -286,11 +294,17 @@ class AI_upscale:
         self.AI_model_path    = find_by_relative_path(f"AI-onnx{os_separator}{self.AI_model_name}_fp16.onnx")
         self.upscale_factor   = self._get_upscale_factor()
         self.inferenceSession = self._load_inferenceSession()
+        self.onnx_input_name, self.onnx_input_dtype = self._get_session_input_metadata()
 
     def _get_upscale_factor(self) -> int:
+        if self.AI_model_name in AI_MODEL_UPSCALE_OVERRIDES:
+            return AI_MODEL_UPSCALE_OVERRIDES[self.AI_model_name]
+
         if   "x1" in self.AI_model_name: return 1
         elif "x2" in self.AI_model_name: return 2
         elif "x4" in self.AI_model_name: return 4
+
+        return 0
 
     def _load_inferenceSession(self) -> None:
         
@@ -304,12 +318,30 @@ class AI_upscale:
             case 'GPU 4': provider_options = [{"device_id": "3"}]
 
         inference_session = InferenceSession(
-            path_or_bytes    = self.AI_model_path, 
+            path_or_bytes    = self.AI_model_path,
             providers        = providers,
             provider_options = provider_options,
         )
 
         return inference_session
+
+    def _get_session_input_metadata(self) -> tuple[str, type]:
+
+        session_inputs = self.inferenceSession.get_inputs()
+
+        if not session_inputs:
+            raise RuntimeError("The selected ONNX model does not expose any inputs.")
+
+        input_info = session_inputs[0]
+        input_type = input_info.type
+
+        if input_type == "tensor(float16)":
+            return input_info.name, float16
+
+        if input_type == "tensor(float)":
+            return input_info.name, float32
+
+        raise ValueError(f"Unsupported ONNX input type: {input_type}")
 
 
 
@@ -487,7 +519,9 @@ class AI_upscale:
         #self.inferenceSession.run_with_iobinding(io_binding)
         #onnx_output = io_binding.copy_outputs_to_cpu()[0]
 
-        onnx_input  = {self.inferenceSession.get_inputs()[0].name: image}
+        image = image.astype(self.onnx_input_dtype, copy=False)
+
+        onnx_input  = {self.onnx_input_name: image}
         onnx_output = self.inferenceSession.run(None, onnx_input)[0]
 
         return onnx_output
@@ -2111,12 +2145,23 @@ def show_error_message(exception: str) -> None:
 
 def get_upscale_factor() -> int:
     global selected_AI_model
-    if MENU_LIST_SEPARATOR[0] in selected_AI_model: upscale_factor = 0
-    elif 'x1' in selected_AI_model: upscale_factor = 1
-    elif 'x2' in selected_AI_model: upscale_factor = 2
-    elif 'x4' in selected_AI_model: upscale_factor = 4
 
-    return upscale_factor
+    try:
+        model_name = selected_AI_model
+    except NameError:
+        model_name = ""
+
+    if not model_name or MENU_LIST_SEPARATOR[0] in model_name:
+        return 0
+
+    if model_name in AI_MODEL_UPSCALE_OVERRIDES:
+        return AI_MODEL_UPSCALE_OVERRIDES[model_name]
+
+    if 'x1' in model_name: return 1
+    if 'x2' in model_name: return 2
+    if 'x4' in model_name: return 4
+
+    return 0
 
 def open_files_action():
 
@@ -2314,7 +2359,7 @@ def place_AI_menu():
             " • Year: 2017\n"
             " • Function: Denoising\n",
 
-            "\n RealESR_Gx4 | RealESR_Animex4 | UltraSharpx4\n"
+            "\n RealESR_Gx4 | RealESR_Animex4 | UltraSharpx4 | ClearRealityV1 | ClearRealityV1_Soft\n"
             "\n • Fast and lightweight AI models\n"
             " • Year: 2022\n"
             " • Function: Upscaling\n",
